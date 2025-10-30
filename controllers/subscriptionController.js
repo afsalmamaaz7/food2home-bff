@@ -622,7 +622,7 @@ const autoExtendSubscriptions = async (req, res) => {
     console.log(`🎯 Auto-extension: FROM ${sourceMonth}/${sourceYear} TO ${extendToMonth}/${extendToYear}`);
     
     // Find active subscriptions from previous month
-    const activeSubscriptions = await CustomerSubscription.find({
+    const allSubscriptions = await CustomerSubscription.find({
       status: 'active',
       'subscriptionPeriod.month': sourceMonth,
       'subscriptionPeriod.year': sourceYear
@@ -630,7 +630,47 @@ const autoExtendSubscriptions = async (req, res) => {
     .populate('customerId', 'name phone email')
     .populate('mealPlanId', 'planName planCode meals pricing');
     
-    console.log(`Found ${activeSubscriptions.length} active subscriptions from ${sourceMonth}/${sourceYear} to extend to ${extendToMonth}/${extendToYear}`);
+    // Get the last day of the source month
+    const lastDayOfSourceMonth = new Date(sourceYear, sourceMonth, 0).getDate();
+    
+    // Filter to only include customers whose latest subscription ends on the last day of the month
+    const eligibleSubscriptions = [];
+    const customerGroups = {};
+    
+    // Group subscriptions by customer
+    allSubscriptions.forEach(sub => {
+      const customerId = sub.customerId._id.toString();
+      if (!customerGroups[customerId]) {
+        customerGroups[customerId] = [];
+      }
+      customerGroups[customerId].push(sub);
+    });
+    
+    // Check each customer's subscriptions for eligibility
+    for (const [customerId, customerSubs] of Object.entries(customerGroups)) {
+      // Find the subscription with the latest end date for this customer
+      let latestSubscription = customerSubs[0];
+      let latestEndDate = new Date(latestSubscription.endDate);
+      
+      for (const sub of customerSubs) {
+        const subEndDate = new Date(sub.endDate);
+        if (subEndDate > latestEndDate) {
+          latestSubscription = sub;
+          latestEndDate = subEndDate;
+        }
+      }
+      
+      // Check if the latest subscription ends on the last day of the month
+      const subscriptionEndDay = latestEndDate.getDate();
+      
+      if (subscriptionEndDay === lastDayOfSourceMonth) {
+        // This customer is eligible for auto-extension
+        eligibleSubscriptions.push(latestSubscription);
+      }
+    }
+    
+    console.log(`Found ${allSubscriptions.length} total active subscriptions from ${sourceMonth}/${sourceYear}`);
+    console.log(`${eligibleSubscriptions.length} subscriptions are eligible for auto-extension (ending on last day of month: ${lastDayOfSourceMonth})`);
     
     const results = {
       extended: [],
@@ -642,7 +682,7 @@ const autoExtendSubscriptions = async (req, res) => {
     const startDate = new Date(extendToYear, extendToMonth - 1, 1);
     const endDate = new Date(extendToYear, extendToMonth, 0);
     
-    for (const subscription of activeSubscriptions) {
+    for (const subscription of eligibleSubscriptions) {
       try {
         // Check if same meal plan subscription already exists for target period
         const existingSubscription = await CustomerSubscription.findOne({
@@ -799,7 +839,7 @@ const getEligibleForAutoExtension = async (req, res) => {
     console.log(`🔍 Checking for eligible subscriptions from: ${dbMonth}/${dbYear}`);
     
     // Find active subscriptions from specified month
-    const eligibleSubscriptions = await CustomerSubscription.find({
+    const subscriptions = await CustomerSubscription.find({
       status: 'active',
       'subscriptionPeriod.month': dbMonth,
       'subscriptionPeriod.year': dbYear
@@ -807,6 +847,45 @@ const getEligibleForAutoExtension = async (req, res) => {
     .populate('customerId', 'name phone email emirates')
     .populate('mealPlanId', 'planName planCode meals pricing')
     .sort({ 'customerId.name': 1 });
+    
+    // Get the last day of the specified month
+    const lastDayOfMonth = new Date(dbYear, dbMonth, 0).getDate();
+    
+    // Filter subscriptions: only include customers whose latest subscription ends on the last day of the month
+    const eligibleSubscriptions = [];
+    const customerGroups = {};
+    
+    // Group subscriptions by customer
+    subscriptions.forEach(sub => {
+      const customerId = sub.customerId._id.toString();
+      if (!customerGroups[customerId]) {
+        customerGroups[customerId] = [];
+      }
+      customerGroups[customerId].push(sub);
+    });
+    
+    // Check each customer's subscriptions
+    for (const [customerId, customerSubs] of Object.entries(customerGroups)) {
+      // Find the subscription with the latest end date for this customer
+      let latestSubscription = customerSubs[0];
+      let latestEndDate = new Date(latestSubscription.endDate);
+      
+      for (const sub of customerSubs) {
+        const subEndDate = new Date(sub.endDate);
+        if (subEndDate > latestEndDate) {
+          latestSubscription = sub;
+          latestEndDate = subEndDate;
+        }
+      }
+      
+      // Check if the latest subscription ends on the last day of the month
+      const subscriptionEndDay = latestEndDate.getDate();
+      
+      if (subscriptionEndDay === lastDayOfMonth) {
+        // This customer is eligible for auto-extension
+        eligibleSubscriptions.push(latestSubscription);
+      }
+    }
     
     const eligibleCustomers = eligibleSubscriptions.map(sub => ({
       subscriptionId: sub._id,
@@ -823,7 +902,9 @@ const getEligibleForAutoExtension = async (req, res) => {
         code: sub.mealPlanId.planCode
       },
       pricing: sub.pricing,
-      period: sub.subscriptionPeriod
+      period: sub.subscriptionPeriod,
+      endDate: sub.endDate,
+      eligibilityReason: `Subscription ends on last day of month (${lastDayOfMonth})`
     }));
     
     res.status(200).json({
