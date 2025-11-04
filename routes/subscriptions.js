@@ -13,6 +13,7 @@ const {
   generatePaymentsForExistingSubscriptions,
   getWeeklySubscriptionReport,
   checkSubscriptionPayments,
+  checkSubscriptionPaymentsBulk,
   deleteSubscription,
   getDeliveryTimeOptions,
   getDeliveryReport
@@ -32,6 +33,7 @@ router.post('/auto-extend', autoExtendSubscriptions);
 router.get('/auto-extend/eligible', getEligibleForAutoExtension);
 router.post('/generate-payments', generatePaymentsForExistingSubscriptions);
 router.post('/generate-payments', generatePaymentsForExistingSubscriptions);
+router.post('/check-payments-bulk', checkSubscriptionPaymentsBulk);
 
 router.get('/customer/:customerId', getCustomerSubscriptions);
 router.get('/:id/check-payments', checkSubscriptionPayments);

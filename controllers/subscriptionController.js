@@ -1252,23 +1252,25 @@ const checkSubscriptionPayments = async (req, res) => {
       });
     }
 
-    // Check for any payments related to this customer during subscription period
+    // Check for payments for this specific subscription month
     const Payment = require('../models/Payment');
     
-    // Get subscription period
-    const subscriptionStartDate = new Date(subscription.startDate);
-    const subscriptionEndDate = new Date(subscription.endDate);
+    // Get subscription period (month and year)
+    const subscriptionMonth = subscription.subscriptionPeriod?.month;
+    const subscriptionYear = subscription.subscriptionPeriod?.year;
     
+    if (!subscriptionMonth || !subscriptionYear) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Subscription period not found' 
+      });
+    }
+    
+    // Check if payment exists for this customer in the specific month/year
     const payments = await Payment.find({
       customer: subscription.customerId,
-      $or: [
-        {
-          year: { 
-            $gte: subscriptionStartDate.getFullYear(),
-            $lte: subscriptionEndDate.getFullYear()
-          }
-        }
-      ]
+      month: subscriptionMonth,
+      year: subscriptionYear
     });
 
     // Set cache control headers to prevent 304 responses
@@ -1288,13 +1290,105 @@ const checkSubscriptionPayments = async (req, res) => {
       data: { 
         hasPayments: payments.length > 0,
         message: payments.length > 0 ? 
-          `${payments.length} payment record(s) exist for this subscription period` : 
-          'No payments found for this subscription'
+          `Payment exists for ${subscriptionMonth}/${subscriptionYear}` : 
+          `No payment found for ${subscriptionMonth}/${subscriptionYear}`
       }
     });
 
   } catch (error) {
     console.error('Check subscription payments error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Server error checking payments' 
+    });
+  }
+};
+
+// @desc    Check payments for multiple subscriptions (bulk operation)
+// @route   POST /api/subscriptions/check-payments-bulk
+// @access  Private
+const checkSubscriptionPaymentsBulk = async (req, res) => {
+  try {
+    const { subscriptionIds } = req.body;
+    
+    // Validate input
+    if (!Array.isArray(subscriptionIds) || subscriptionIds.length === 0) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'subscriptionIds must be a non-empty array' 
+      });
+    }
+
+    // Validate ObjectId format for all IDs
+    const invalidIds = subscriptionIds.filter(id => !id.match(/^[0-9a-fA-F]{24}$/));
+    if (invalidIds.length > 0) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Invalid subscription ID format',
+        invalidIds 
+      });
+    }
+
+    // Get all subscriptions in one query
+    const subscriptions = await CustomerSubscription.find({
+      _id: { $in: subscriptionIds }
+    }).lean();
+
+    if (subscriptions.length === 0) {
+      return res.status(404).json({ 
+        success: false, 
+        message: 'No subscriptions found' 
+      });
+    }
+
+    // Build query to check payments for all customers
+    const Payment = require('../models/Payment');
+    const customerIds = [...new Set(subscriptions.map(s => s.customerId))];
+    
+    // Get all payments for these customers
+    const payments = await Payment.find({
+      customer: { $in: customerIds }
+    }).lean();
+
+    // Build result map: subscriptionId -> hasPayments
+    const paymentStatusMap = {};
+    
+    subscriptions.forEach(subscription => {
+      const subscriptionMonth = subscription.subscriptionPeriod?.month;
+      const subscriptionYear = subscription.subscriptionPeriod?.year;
+      
+      if (!subscriptionMonth || !subscriptionYear) {
+        paymentStatusMap[subscription._id] = false;
+        return;
+      }
+      
+      // Check if customer has payment for the specific subscription month/year
+      // The month and year are at the payment document level, not in paymentHistory
+      const hasPayments = payments.some(payment => 
+        payment.customer.toString() === subscription.customerId.toString() &&
+        payment.month === subscriptionMonth &&
+        payment.year === subscriptionYear
+      );
+      
+      paymentStatusMap[subscription._id] = hasPayments;
+    });
+
+    // Set cache control headers to prevent 304 responses
+    res.set({
+      'Cache-Control': 'no-cache, no-store, must-revalidate',
+      'Pragma': 'no-cache',
+      'Expires': '0'
+    });
+
+    res.status(200).json({
+      success: true,
+      timestamp: new Date().toISOString(),
+      count: subscriptions.length,
+      paymentStatus: paymentStatusMap
+    });
+
+  } catch (error) {
+    console.error('Check subscription payments bulk error:', error);
     res.status(500).json({ 
       success: false, 
       message: 'Server error checking payments' 
@@ -1330,27 +1424,46 @@ const deleteSubscription = async (req, res) => {
     // Check for any payments for this customer/subscription
     const Payment = require('../models/Payment');
     
-    // Get subscription period to check for payments
+    // Get subscription period months to check for specific payment records
     const subscriptionStartDate = new Date(subscription.startDate);
     const subscriptionEndDate = new Date(subscription.endDate);
     
-    // Check for any payments related to this customer in the subscription period
-    const payments = await Payment.find({
-      customer: subscription.customerId,
-      $or: [
-        {
-          year: { 
-            $gte: subscriptionStartDate.getFullYear(),
-            $lte: subscriptionEndDate.getFullYear()
-          }
-        }
-      ]
-    });
+    // Extract all months covered by this subscription
+    const subscriptionMonths = [];
+    let currentDate = new Date(subscriptionStartDate);
+    
+    while (currentDate <= subscriptionEndDate) {
+      subscriptionMonths.push({
+        month: currentDate.getMonth() + 1,
+        year: currentDate.getFullYear()
+      });
+      
+      // Move to next month
+      currentDate.setMonth(currentDate.getMonth() + 1);
+      currentDate.setDate(1); // Reset to first day of month
+    }
+    
+    // Check for payments in any of the subscription months
+    const paymentChecks = await Promise.all(
+      subscriptionMonths.map(({ month, year }) =>
+        Payment.findOne({
+          customer: subscription.customerId,
+          month: month,
+          year: year
+        })
+      )
+    );
+    
+    const paymentsFound = paymentChecks.filter(payment => payment !== null);
 
-    if (payments.length > 0) {
+    if (paymentsFound.length > 0) {
+      const paymentMonths = paymentsFound.map(p => 
+        `${new Date(p.year, p.month - 1).toLocaleDateString('default', { month: 'long', year: 'numeric' })}`
+      ).join(', ');
+      
       return res.status(400).json({
         success: false,
-        message: `Cannot delete subscription: ${payments.length} payment record(s) exist for this customer during the subscription period. Please delete payments first.`
+        message: `Cannot delete subscription: Payment record(s) exist for ${paymentMonths}. Please delete the payment(s) first.`
       });
     }
 
@@ -1557,7 +1670,7 @@ const getDeliveryReport = async (req, res) => {
       };
     }).filter(item => item !== null); // Remove null entries
 
-    // Sort by building name (ascending), then by customer name
+    // Sort by building name (ascending), then by flat number, then by customer name
     deliveryPlan.sort((a, b) => {
       const buildingA = (a.customer.buildingName === 'N/A' || !a.customer.buildingName) ? 'ZZZZ' : a.customer.buildingName;
       const buildingB = (b.customer.buildingName === 'N/A' || !b.customer.buildingName) ? 'ZZZZ' : b.customer.buildingName;
@@ -1566,7 +1679,15 @@ const getDeliveryReport = async (req, res) => {
         return buildingA.localeCompare(buildingB);
       }
       
-      // If same building, sort by customer name
+      // If same building, sort by flat number
+      const flatA = (a.customer.flatNumber === 'N/A' || !a.customer.flatNumber) ? 'ZZZZ' : a.customer.flatNumber;
+      const flatB = (b.customer.flatNumber === 'N/A' || !b.customer.flatNumber) ? 'ZZZZ' : b.customer.flatNumber;
+      
+      if (flatA !== flatB) {
+        return flatA.localeCompare(flatB);
+      }
+      
+      // If same building and flat, sort by customer name
       return a.customer.name.localeCompare(b.customer.name);
     });
 
@@ -1633,6 +1754,7 @@ module.exports = {
   generatePaymentsForExistingSubscriptions,
   getWeeklySubscriptionReport,
   checkSubscriptionPayments,
+  checkSubscriptionPaymentsBulk,
   deleteSubscription,
   getDeliveryTimeOptions,
   getDeliveryReport
